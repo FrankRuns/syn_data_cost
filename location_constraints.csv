@@ -1,0 +1,6 @@
+location_name,location_type,max_capacity_units,throughput_limit_units_per_day
+Washington DC,DC,60000,100000
+Dallas TX,DC,80000,100000
+Los Angeles CA,DC,70000,200000
+Phoenix AZ,Plant,1000000,60000
+Charlotte NC,Plant,1000000,50000

@@ -1,0 +1,4 @@
+origin_id,dest_id,max_shipments_per_day
+Washington DC,Dallas TX,20
+Washington DC,Los Angeles CA,10
+Phoenix AZ,Los Angeles CA,15
