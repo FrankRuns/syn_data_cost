@@ -14,8 +14,10 @@ loc_constraints = pd.read_csv('location_constraints.csv')
 prod_constraints = pd.read_csv('production_constraints.csv')
 lane_constraints = pd.read_csv('lane_constraints.csv')
 
+UNITS_PER_TRUCK = 100
+
 def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 3958.8  # Earth's radius in miles
+    R = 3958.8
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
     dlon = lon2 - lon1
@@ -23,7 +25,7 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
-def run_optimization(rate_increase, min_fulfillment):
+def run_optimization(rate_increase, dc_throughput_cost, min_fulfillment):
     location_types = dict(zip(locations['name'], locations['type']))
     dc_capacity = {row['location_name']: {'max_capacity_units': row['max_capacity_units'],
                                         'throughput_limit_units_per_day': row['throughput_limit_units_per_day']}
@@ -59,26 +61,33 @@ def run_optimization(rate_increase, min_fulfillment):
     for (o, d), max_ship in lane_cap.items():
         solver.Add(flow_vars[(o, d)] <= max_ship)
     
-    # Minimum demand fulfillment constraint
     total_demand = sum(customer_demand.values())
     total_shortfall = solver.Sum(shortfall_vars.values())
     solver.Add(total_shortfall <= (1 - min_fulfillment) * total_demand)
     
-    # Objective with rate increase (as a percentage)
+    cost_multiplier = 1 + (rate_increase / 100.0)
+    transport_cost = solver.Sum((flow_vars[(o, d)] / UNITS_PER_TRUCK) * lane_cost[(o, d)] * cost_multiplier
+                               for (o, d) in flow_vars)
+    
+    dc_throughput = {}
+    for dc in dc_capacity.keys():
+        inbound = [flow_vars[(o, d)] for (o, d) in flow_vars if d == dc]
+        outbound = [flow_vars[(o, d)] for (o, d) in flow_vars if o == dc]
+        dc_throughput[dc] = solver.Sum(inbound) + solver.Sum(outbound)
+    dc_cost = solver.Sum(dc_throughput[dc] * dc_throughput_cost for dc in dc_capacity.keys())
+    
     BIG_PENALTY = 10000
-    cost_multiplier = 1 + (rate_increase / 100.0)  # Convert % increase to multiplier (e.g., 5% -> 1.05)
-    objective = solver.Sum(flow_vars[(o, d)] * lane_cost[(o, d)] * cost_multiplier for (o, d) in flow_vars) + \
-                solver.Sum(sf * BIG_PENALTY for sf in shortfall_vars.values())
+    objective = transport_cost + dc_cost + solver.Sum(sf * BIG_PENALTY for sf in shortfall_vars.values())
     solver.Minimize(objective)
     
     status = solver.Solve()
     if status == pywraplp.Solver.OPTIMAL:
-        return flow_vars, shortfall_vars, location_types, lane_distance, lane_cost, solver
+        return flow_vars, shortfall_vars, location_types, lane_distance, lane_cost, dc_throughput, solver
     return None
 
 # Dash app
 app = dash.Dash(__name__)
-server = app.server  # For Render
+server = app.server
 
 app.layout = html.Div([
     html.H1("Cost Impact Dashboard", style={'textAlign': 'center', 'marginBottom': '10px'}),
@@ -87,9 +96,19 @@ app.layout = html.Div([
         dcc.Input(
             id='rate-increase-input',
             type='number',
-            value=5.0,  # Default to 5%
+            value=1.0,
             min=0.0,
-            max=10.0,
+            max=20.0,
+            step=0.1,
+            style={'width': '200px', 'marginRight': '20px'}
+        ),
+        html.Label("DC Throughput Cost ($/unit):", style={'marginRight': '10px'}),
+        dcc.Input(
+            id='dc-throughput-cost-input',
+            type='number',
+            value=2.0,
+            min=0.0,
+            max=100.0,
             step=0.1,
             style={'width': '200px', 'marginRight': '20px'}
         ),
@@ -110,28 +129,11 @@ app.layout = html.Div([
         children=[
             html.Div([
                 html.Div([
-                    dash_table.DataTable(
-                        id='metrics-table',
-                        style_table={'width': '100%'}
-                    ),
-                    dcc.Graph(
-                        id='cost-chart',
-                        style={'height': '350px', 'marginTop': '10px'}
-                    )
-                ], style={
-                    'width': '40%',
-                    'display': 'inline-block',
-                    'verticalAlign': 'top',
-                    'padding': '10px'
-                }),
-                dcc.Graph(
-                    id='network-map',
-                    style={
-                        'width': '60%',
-                        'display': 'inline-block',
-                        'height': '550px'
-                    }
-                )
+                    dash_table.DataTable(id='metrics-table', style_table={'width': '100%'}),
+                    dcc.Graph(id='cost-chart', style={'height': '350px', 'marginTop': '10px'}),
+                    dcc.Graph(id='cost-distribution-chart', style={'height': '350px', 'marginTop': '10px'})
+                ], style={'width': '40%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '10px'}),
+                dcc.Graph(id='network-map', style={'width': '60%', 'display': 'inline-block', 'height': '750px'})
             ], style={'display': 'flex', 'flexDirection': 'row', 'height': 'calc(100vh - 150px)'})
         ]
     )
@@ -141,119 +143,129 @@ app.layout = html.Div([
     [Output('metrics-table', 'data'),
      Output('metrics-table', 'columns'),
      Output('network-map', 'figure'),
-     Output('cost-chart', 'figure')],
+     Output('cost-chart', 'figure'),
+     Output('cost-distribution-chart', 'figure')],
     [Input('rate-increase-input', 'value'),
+     Input('dc-throughput-cost-input', 'value'),
      Input('min-fulfillment-slider', 'value')]
 )
-def update_dashboard(rate_increase, min_fulfillment):
-    if rate_increase is None or rate_increase < 0.0 or rate_increase > 10.0:
+def update_dashboard(rate_increase, dc_throughput_cost, min_fulfillment):
+    if rate_increase is None or rate_increase < 0.0 or rate_increase > 20.0 or \
+       dc_throughput_cost is None or dc_throughput_cost < 0.0 or dc_throughput_cost > 50.0:
         empty_fig = go.Figure()
-        return ([], [], empty_fig, empty_fig)
-    if min_fulfillment is None or min_fulfillment < 80 or min_fulfillment > 100:
-        empty_fig = go.Figure()
-        return ([], [], empty_fig, empty_fig)
-    
-    # Convert min_fulfillment to fraction
+        return ([], [], empty_fig, empty_fig, empty_fig)
     min_fulfillment = min_fulfillment / 100.0
     
-    # Run three optimizations: 0%, user input, and user input + 2%
-    rate_increases = [0.0, rate_increase, rate_increase + 2.0]
-    results = [run_optimization(r, min_fulfillment) for r in rate_increases]
-    
-    if any(r is None for r in results):
+    result = run_optimization(rate_increase, dc_throughput_cost, min_fulfillment)
+    if result is None:
         empty_fig = go.Figure()
-        return ([], [], empty_fig, empty_fig)
+        return ([], [], empty_fig, empty_fig, empty_fig)
     
-    # Calculate metrics for all scenarios
+    flow_vars, shortfall_vars, location_types, lane_distance, lane_cost, dc_throughput, _ = result
+    
     total_demand = sum(demand_df['demand'])
-    metrics_data = []
-    total_costs = []
+    total_shortfall = sum(sf.solution_value() for sf in shortfall_vars.values())
+    fulfilled_demand = total_demand - total_shortfall
     
-    for i, (r, result) in enumerate(zip(rate_increases, results)):
-        flow_vars, shortfall_vars, location_types, lane_distance, lane_cost, _ = result
-        total_shortfall = sum(sf.solution_value() for sf in shortfall_vars.values())
-        fulfilled_demand = total_demand - total_shortfall
-        
-        cost_multiplier = 1 + (r / 100.0)  # Convert % increase to multiplier
-        transport_cost = sum(flow_vars[(o, d)].solution_value() * lane_cost[(o, d)] * cost_multiplier
-                            for (o, d) in flow_vars)
-        shortfall_cost = sum(sf.solution_value() * 10000 for sf in shortfall_vars.values())
-        total_cost = transport_cost + shortfall_cost
-        
-        total_costs.append(total_cost)
-        
-        scenario = f'{rate_increases[i]:.1f}%'
-        metrics_data.append({
-            'Scenario': scenario,
-            'Transport Cost': f'${transport_cost:.0f}',
-            'Shortfall Cost': f'${shortfall_cost:.0f}',
-            'Total Cost': f'${total_cost:.0f}',
-            '% Fulfilled': f'{(fulfilled_demand/total_demand*100):.1f}%'
-        })
+    cost_multiplier = 1 + (rate_increase / 100.0)
+    transport_cost = sum((flow_vars[(o, d)].solution_value() / UNITS_PER_TRUCK) * lane_cost[(o, d)] * cost_multiplier
+                        for (o, d) in flow_vars)
+    dc_cost = sum(dc_throughput[dc].solution_value() * dc_throughput_cost for dc in dc_throughput.keys())
+    shortfall_cost = sum(sf.solution_value() * 10000 for sf in shortfall_vars.values())
+    total_cost = transport_cost + dc_cost + shortfall_cost
     
-    # Network Map (using user input scenario, i.e., middle scenario)
-    flow_vars, _, location_types, lane_distance, _, _ = results[1]
+    transport_cost_per_unit = transport_cost / fulfilled_demand if fulfilled_demand > 0 else 0
+    dc_cost_per_unit = dc_cost / fulfilled_demand if fulfilled_demand > 0 else 0
+    total_cost_per_unit = (transport_cost + dc_cost) / fulfilled_demand if fulfilled_demand > 0 else 0
+    
+    print(f"Total Demand: {total_demand}, Fulfilled: {fulfilled_demand}")
+    print(f"Transport Cost: ${transport_cost:.2f}, DC Cost: ${dc_cost:.2f}, Ratio (Trans/DC): {transport_cost/dc_cost if dc_cost > 0 else 'inf'}")
+    print(f"Per Unit - Transport: ${transport_cost_per_unit:.2f}, DC: ${dc_cost_per_unit:.2f}, Total: ${total_cost_per_unit:.2f}")
+    
+    metrics_data = [{
+        'Scenario': f'{rate_increase}% Rate, ${dc_throughput_cost}/unit DC',
+        'Transport Cost': f'${transport_cost:.0f}',
+        'DC Cost': f'${dc_cost:.0f}',
+        'Shortfall Cost': f'${shortfall_cost:.0f}',
+        'Total Cost': f'${total_cost:.0f}',
+        '% Fulfilled': f'{(fulfilled_demand/total_demand*100):.1f}%'
+    }]
+    columns = [{'name': k, 'id': k} for k in metrics_data[0].keys()]
+    
+    # Customizable map colors
+    MARKER_COLORS = {
+        'DC': '#FFA500',      # Orange for DCs
+        'Plant': '#00CED1',   # Turquoise for Plants
+        'Customer': '#32CD32' # Lime green for Customers
+    }
+    LINE_COLORS = {
+        'to_customer': '#FF4500',  # Orange-red for flows to customers
+        'other': '#4682B4'         # Steel blue for other flows
+    }
+    
     map_fig = go.Figure()
     map_fig.add_trace(go.Scattergeo(
         lon=locations['longitude'],
         lat=locations['latitude'],
         text=locations['name'],
         mode='markers',
-        marker=dict(size=12, color=['red' if t == 'DC' else 'blue' if t == 'Plant' else 'green' for t in locations['type']])
+        marker=dict(
+            size=12,
+            color=[MARKER_COLORS['DC'] if t == 'DC' else MARKER_COLORS['Plant'] if t == 'Plant' else MARKER_COLORS['Customer']
+                   for t in locations['type']]
+        )
     ))
-    
     for (o, d), var in flow_vars.items():
         flow_value = var.solution_value()
         if flow_value > 0:
             o_loc = locations[locations['name'] == o].iloc[0]
             d_loc = locations[locations['name'] == d].iloc[0]
-            color = 'purple' if d.startswith('CUST_') else 'gray'
+            color = LINE_COLORS['to_customer'] if d.startswith('CUST_') else LINE_COLORS['other']
             width = max(1, flow_value / 2)
             map_fig.add_trace(go.Scattergeo(
                 lon=[o_loc['longitude'], d_loc['longitude']],
                 lat=[o_loc['latitude'], d_loc['latitude']],
                 mode='lines',
-                line=dict(width=width, color=color),
+                line=dict(width=1, color=color),
                 opacity=0.7,
                 hoverinfo='text',
                 text=f'{o} to {d}: {flow_value:.1f} units'
             ))
-    
     map_fig.update_layout(
         geo=dict(scope='usa', projection_type='albers usa'),
         showlegend=False,
-        height=550,
+        height=750,
         margin=dict(l=0, r=0, t=0, b=0)
     )
     
-    # Cost Chart
     cost_fig = go.Figure()
-    cost_fig.add_trace(go.Scatter(
-        x=rate_increases,
-        y=total_costs,
-        mode='lines+markers',
-        line=dict(color='blue'),
-        marker=dict(size=10),
-        hovertemplate='Rate Increase: %{x:.1f}%<br>Total Cost: $%{y:.0f}'
+    cost_fig.add_trace(go.Bar(
+        x=['Transport', 'DC', 'Shortfall'],
+        y=[transport_cost, dc_cost, shortfall_cost],
+        marker_color=['#1f77b4', '#ff7f0e', '#d62728'],
+        hovertemplate='%{x}: $%{y:.0f}'
     ))
     cost_fig.update_layout(
-        title='Total Cost vs Transportation Rate Increase',
-        xaxis_title='Rate Increase (%)',
-        yaxis_title='Total Cost ($)',
-        height=350,
-        margin=dict(l=50, r=50, t=50, b=50)
+        title='Total Cost Breakdown',
+        yaxis_title='Cost ($)',
+        height=350
     )
     
-    # Table columns
-    columns = [
-        {'name': 'Scenario', 'id': 'Scenario'},
-        {'name': 'Transport Cost', 'id': 'Transport Cost'},
-        {'name': 'Shortfall Cost', 'id': 'Shortfall Cost'},
-        {'name': 'Total Cost', 'id': 'Total Cost'},
-        {'name': '% Fulfilled', 'id': '% Fulfilled'}
-    ]
+    dist_fig = go.Figure()
+    dist_fig.add_trace(go.Bar(
+        x=['Transportation', 'DC Throughput', 'Total (Trans + DC)'],
+        y=[transport_cost_per_unit, dc_cost_per_unit, total_cost_per_unit],
+        marker_color=['#1f77b4', '#ff7f0e', '#2ca02c'],
+        hovertemplate='%{x}: $%{y:.2f}/unit<br>Total: $%{customdata:.0f}',
+        customdata=[transport_cost, dc_cost, transport_cost + dc_cost]
+    ))
+    dist_fig.update_layout(
+        title='Cost Distribution per Unit Fulfilled',
+        yaxis_title='Cost per Unit ($)',
+        height=350
+    )
     
-    return (metrics_data, columns, map_fig, cost_fig)
+    return (metrics_data, columns, map_fig, cost_fig, dist_fig)
 
 if __name__ == '__main__':
     app.run_server(debug=True)
